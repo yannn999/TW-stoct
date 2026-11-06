@@ -146,6 +146,10 @@ def main(argv=None) -> int:
     ap.add_argument("--dry-run", action="store_true", help="只印出訊息，不傳也不寫紀錄")
     args = ap.parse_args(argv)
 
+    if not args.dry_run and not (os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID")):
+        print("還沒有設定 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID，略過通知。設定方式見 README「收盤通知設定」。")
+        return 0
+
     today = datetime.now(TZ).date()
     token = os.environ.get("FINMIND_TOKEN", "")
     store = storage.from_env()
