@@ -1,0 +1,94 @@
+# 台股分析 App
+
+用來長期追蹤 0050、0056 等台股的網頁 App，手機也能用。資料來自 FinMind（證交所、櫃買中心公開資料）。
+
+## 部署到雲端（手機用）
+
+### 1. 取得 FinMind token
+到 https://finmindtrade.com 免費註冊，在會員頁面複製 API token。
+雲端主機的 IP 是很多人共用的，沒有 token 很快就會被限制查詢次數，所以這一步一定要做。
+
+### 2. 把程式放上 GitHub
+1. 登入 GitHub，右上角「+」→「New repository」，名稱例如 `tw-stock-app`，選 Private 或 Public 都可以，按「Create repository」。
+2. 在新 repo 的頁面點「uploading an existing file」，把資料夾裡的所有檔案拖進去，按「Commit changes」。
+   - Mac 的 Finder 預設看不到 `.streamlit` 資料夾，看不到就略過，它不是必要的。
+   - 不要上傳 `secrets.toml`（裡面會有 token 和密碼）。
+
+### 3. 部署到 Streamlit Community Cloud（免費）
+1. 到 https://share.streamlit.io ，用 GitHub 帳號登入。
+2. 按「Create app」→ 選從 GitHub 部署，填入：
+   - Repository：剛剛建立的 repo
+   - Branch：`main`
+   - Main file path：`app.py`
+3. 打開「Advanced settings」：
+   - Python version 選 3.12
+   - Secrets 貼上下面兩行（改成你自己的值）：
+     ```toml
+     FINMIND_TOKEN = "你的 FinMind token"
+     APP_PASSWORD = "自己設一組密碼"
+     ```
+     不想要密碼就只貼第一行。
+4. 按「Deploy」，等幾分鐘就會得到一個 `https://xxx.streamlit.app` 的網址。
+
+### 4. 加到手機主畫面
+1. 用手機打開網址，在「自選股」分頁設定好清單（預設是 0050、0056）。
+2. iPhone：Safari 分享按鈕 →「加入主畫面」。Android：Chrome 選單 →「加到主畫面」。
+3. 自選股和目前選的股票存在網址裡，從主畫面打開就是同一份清單。
+
+### 之後要更新程式
+在 GitHub repo 上傳新版檔案覆蓋舊的，Streamlit Cloud 會在一兩分鐘內自動更新。
+
+### 注意
+- App 一段時間沒人用會休眠，下次打開要等幾十秒喚醒，按畫面上的按鈕即可。
+- 知道網址的人都能打開，所以建議設密碼。
+
+## 在自己電腦上執行
+
+需要 Python 3.10 以上：
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+Windows 也可以直接雙擊 `run.bat`。Token 可以貼在側邊欄，或設成環境變數 `FINMIND_TOKEN`。
+
+## 功能
+
+| 分頁 | 內容 |
+|---|---|
+| 分析 | 你的加碼條件是否成立；年線位階（和過去 5 年比）、距近一年高點、長期趨勢、殖利率位階、和台積電的連動；年線乖離走勢圖；短線指標參考 |
+| 圖表 | 日/週/月 K 線（可切換還原權息）、均線或布林通道、KD/RSI/MACD；配息紀錄與殖利率；個股另有本益比與月營收；三大法人買賣超 |
+| 定期定額 | 設定加碼規則與每月金額，比較「純定期定額」「定期定額＋逢低加碼」「單筆投入」的報酬、年化報酬（XIRR）、最大帳面虧損 |
+| 自選股 | 多檔一起看年線乖離、乖離分位、距高點、殖利率、加碼條件、RSI、KD |
+| 短線回測 | 均線、MACD、KD 交叉策略，和買進持有比較 |
+
+## 價格怎麼處理
+
+- **分割**：0050 在 2025-06-18 一拆四。分割前的價格會自動換算成分割後的單位，圖表和指標才不會在那天出現假的暴跌。
+- **還原權息**：位階、年線乖離和回測都把配息加回去計算。0056 這種高配息的 ETF，如果只看股價，會因為每次除息都往下掉而低估報酬。
+- K 線圖預設顯示「只換算分割」的價格，和現在的報價一致；打開「還原權息價格」可以看含配息的走勢。
+
+## 位階判斷規則
+
+| 項目 | 偏便宜 | 偏貴 |
+|---|---|---|
+| 年線位階 | 年線乖離在過去 5 年的 25% 分位以下 | 75% 分位以上 |
+| 近一年高點 | 從高點回檔 10% 以上 | 不判斷偏貴（長期上漲的標的常創新高） |
+| 殖利率位階 | 殖利率在過去 5 年的 75% 分位以上 | 25% 分位以下 |
+
+長期趨勢：季線在年線之上且年線上揚為多頭，兩者都相反為空頭，其他為整理。
+
+## 檔案
+
+```
+app.py          介面
+finmind.py      資料讀取
+adjust.py       分割與還原權息
+longterm.py     位階分析、加碼規則、定期定額回測
+indicators.py   技術指標
+backtest.py     短線策略回測
+charts.py       圖表
+```
+
+本工具只整理數據，不構成投資建議。
