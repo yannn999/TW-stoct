@@ -259,10 +259,11 @@ with tab_an:
     if pd.notna(last_feat["bias"]) or pd.notna(last_feat["dd"]):
         t = rule.tier(last_feat)
         m = rule.mult[t]
-        msg = (f"**依你的規則，目前位階：{lt.TIER_LABEL[t]}**　→　本月投入基本金額的 **{m:g} 倍**  \n"
+        msg = (f"**本月建議：{lt.TIER_ACTION[t]}**（位階：{lt.TIER_LABEL[t]}，投入基本金額的 {m:g} 倍）  \n"
                + "  \n".join(f"・{r}" for r in rule.reasons(last_feat)))
         (st.success if t in ("dip", "cheap") else st.warning if t == "expensive" else st.info)(msg)
-        st.caption("規則和倍數可以在「投資計畫」分頁調整，那裡也會算出這個月要投入多少錢。")
+        st.caption("這個建議是依你在「投資計畫」分頁設定的規則算出來的，規則和倍數可以在那裡調整，"
+                   "那裡也會算出這個月要投入多少錢。")
 
     # ---- 規則式分析
     findings = lt.analyze(feat, yld, corr_with_2330(stock_id, a, token))
@@ -427,7 +428,7 @@ with tab_plan:
         px_now = last_split["close"]
         n_sh = int(amt // (px_now * (1 + lt.FEE_RATE)))
         stat_grid([
-            ("目前位階", lt.TIER_LABEL[t], None),
+            ("本月建議", lt.TIER_ACTION[t], f"位階：{lt.TIER_LABEL[t]}"),
             ("倍數", f"{m:g} 倍", None),
             ("本月投入", f"{amt:,.0f} 元", None),
             ("約可買", f"{n_sh:,} 股", f"以收盤 {px_now:,.2f} 計"),
@@ -438,8 +439,8 @@ with tab_plan:
         if m > 1 and amt < base * m:
             lines.append(f"規則要投 {base * m:,.0f} 元，但準備金只剩 {reserve_now:,.0f} 元，所以只能投 {amt:,.0f} 元。")
         st.markdown("\n".join(f"- {x}" for x in lines))
-        st.caption(f"依據 {a.split.index[-1]:%Y-%m-%d} 收盤資料。這是照你設定的規則算出來的金額，不是投資建議；"
-                   "規則本身是否合適，可以參考下面的回測。")
+        st.caption(f"依據 {a.split.index[-1]:%Y-%m-%d} 收盤資料，依你設定的規則計算。"
+                   "規則本身是否合適，可以參考下面的回測；位階便宜不代表之後不會再跌。")
 
     # ---- 4. 回測
     st.markdown("**4. 這套規則過去的表現**")
@@ -556,7 +557,7 @@ with tab_watch:
                     "年線乖離%": wl["bias"], "乖離分位": wl["bias_pct"],
                     "距高點%": wl["dd"],
                     "殖利率%": wy.dropna().iloc[-1] if wy is not None and wy.notna().any() else np.nan,
-                    "本月級別": f"{lt.TIER_LABEL[rule.tier(wl)]} ×{rule.mult[rule.tier(wl)]:g}",
+                    "本月建議": f"{lt.TIER_ACTION[rule.tier(wl)]} ×{rule.mult[rule.tier(wl)]:g}",
                     "RSI": snap["RSI"], "KD": snap["KD"],
                 })
             bar.progress((i + 1) / len(watch), text=f"讀取自選股…{sid}")
@@ -571,7 +572,7 @@ with tab_watch:
                 .map(color_updown, subset=["漲跌%"]),
                 width="stretch", height=min(600, 40 + 36 * len(table)))
             st.caption(f"乖離分位：目前的年線乖離比過去 5 年中多少 % 的日子高（越低越便宜）。"
-                       "本月級別：依「投資計畫」分頁的規則，這個月屬於哪一級、投入基本金額的幾倍。"
+                       "本月建議：依你在「投資計畫」分頁設定的規則，這個月該加碼、正常投入或減碼，以及投入基本金額的幾倍。"
                        "要看單一檔的詳細分析，請在最上方選擇該股票。")
 
 # ================================================================ 短線回測

@@ -89,6 +89,7 @@ class DipRule:
 TIERS = ["dip", "cheap", "neutral", "expensive"]
 TIER_LABEL = {"dip": "大跌", "cheap": "偏便宜", "neutral": "中性", "expensive": "偏貴"}
 TIER_COLOR = {"dip": "green", "cheap": "green", "neutral": "gray", "expensive": "red"}
+TIER_ACTION = {"dip": "建議大幅加碼", "cheap": "建議加碼", "neutral": "正常投入", "expensive": "建議減碼"}
 DEFAULT_MULT = {"dip": 2.0, "cheap": 1.5, "neutral": 1.0, "expensive": 0.75}
 
 
