@@ -13,7 +13,8 @@ UP = "#e5383b"
 DOWN = "#1a9e5c"
 MA_COLORS = {5: "#f4a261", 10: "#e9c46a", 20: "#4361ee", 60: "#9d4edd", 120: "#6c757d", 240: "#8d6e63"}
 INST_COLORS = {"外資": "#4361ee", "投信": "#f4a261", "自營商": "#9d4edd"}
-DCA_COLORS = {"純定期定額": "#4361ee", "定期定額＋逢低加碼": "#e5383b", "單筆投入": "#8d99ae"}
+PLAN_COLORS = ["#e5383b", "#4361ee", "#8d99ae"]
+TIER_COLORS = {"大跌": "#1a9e5c", "偏便宜": "#74c69d", "中性": "#8d99ae", "偏貴": "#e5383b"}
 GRID = "rgba(128,128,128,0.35)"
 CONFIG = {"displayModeBar": False, "scrollZoom": False}
 
@@ -154,27 +155,36 @@ def institutional(df: pd.DataFrame, price: pd.Series | None = None) -> go.Figure
 
 
 def dca(results: list) -> go.Figure:
+    """各方案的總值（實線）與累計投入（虛線，只畫第一個方案，三者投入相同時就是同一條）。"""
     fig = go.Figure()
-    for r in results:
-        color = DCA_COLORS.get(r.name, "#888")
-        fig.add_trace(go.Scatter(x=r.daily.index, y=r.daily["value"], name=f"{r.name} 市值",
-                                 line=dict(color=color, width=2)))
-        if r.name != "單筆投入":
-            fig.add_trace(go.Scatter(x=r.daily.index, y=r.daily["invested"], name=f"{r.name} 投入",
-                                     line=dict(color=color, width=1, dash="dot")))
+    for i, r in enumerate(results):
+        color = PLAN_COLORS[i % len(PLAN_COLORS)]
+        fig.add_trace(go.Scatter(x=r.daily.index, y=r.daily["value"], name=r.name,
+                                 line=dict(color=color, width=2 if i == 0 else 1.5)))
+    r0 = results[0]
+    fig.add_trace(go.Scatter(x=r0.daily.index, y=r0.daily["invested"], name="累計投入",
+                             line=dict(color="#8d6e63", width=1, dash="dot")))
+    if "reserve" in r0.daily and r0.daily["reserve"].max() > 0:
+        fig.add_trace(go.Scatter(x=r0.daily.index, y=r0.daily["reserve"], name=f"{r0.name} 準備金",
+                                 line=dict(color=PLAN_COLORS[0], width=1, dash="dash")))
     fig.update_yaxes(title_text="元", tickformat=",")
     return _base_layout(fig, 380)
 
 
-def dip_marks(price: pd.Series, events: pd.DataFrame) -> go.Figure:
+def tier_marks(price: pd.Series, events: pd.DataFrame) -> go.Figure:
+    """股價走勢上標出每個月的位階與投入金額。"""
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=price.index, y=price, name="收盤價", line=dict(color="#8d6e63", width=1.3)))
-    if not events.empty:
-        e = events[events["類型"] == "逢低加碼"]
-        if not e.empty:
-            fig.add_trace(go.Scatter(x=pd.to_datetime(e["日期"]), y=e["價格"], mode="markers", name="逢低加碼",
-                                     marker=dict(symbol="triangle-up", size=10, color=UP)))
-    return _base_layout(fig, 300)
+    if not events.empty and "位階" in events:
+        e = events[events["類型"] == "分級投入"]
+        for tier, color in TIER_COLORS.items():
+            sub = e[e["位階"] == tier]
+            if len(sub):
+                fig.add_trace(go.Scatter(
+                    x=pd.to_datetime(sub["日期"]), y=sub["價格"], mode="markers", name=tier,
+                    marker=dict(size=9, color=color, line=dict(width=1, color="white")),
+                    customdata=sub["金額"], hovertemplate="%{x|%Y-%m-%d}<br>投入 %{customdata:,.0f} 元"))
+    return _base_layout(fig, 320)
 
 
 def equity(eq: pd.Series, bench: pd.Series) -> go.Figure:

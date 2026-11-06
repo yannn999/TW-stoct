@@ -23,7 +23,7 @@ import longterm as lt
 st.set_page_config(page_title="台股分析", page_icon="📈", layout="wide",
                    initial_sidebar_state="collapsed")
 
-HIST_DAYS = 365 * 6 + 120          # 抓 6 年多，才有 5 年的位階可比
+HIST_DAYS = 365 * 8 + 120          # 抓 8 年：1 年算年線、再 1 年起算分位，回測還能有 5 年以上
 DEFAULT_WATCH = ["0050", "0056"]
 FREQ_LABEL = {"日K": "D", "週K": "W", "月K": "M"}
 RANGE_BARS = {"3個月": 63, "6個月": 126, "1年": 250, "3年": 750, "全部": None}
@@ -130,9 +130,12 @@ def yield_series(a: adj.Adjusted) -> pd.Series | None:
     return adj.trailing_yield(a.split["close"], a.dividends) if len(a.dividends) else None
 
 
-def current_rule() -> lt.DipRule:
-    return lt.DipRule(st.session_state.get("rule_kind", "drawdown"),
-                      float(st.session_state.get("rule_thr", 10.0)))
+def current_rule() -> lt.TierRule:
+    """投資計畫分頁的設定；其他分頁也用同一份。還沒打開過該分頁時用預設值。"""
+    ss = st.session_state
+    dip = lt.DipRule(ss.get("rule_kind", "drawdown"), float(ss.get("rule_thr", 10.0)))
+    mult = {t: float(ss.get(f"m_{t}", lt.DEFAULT_MULT[t])) for t in lt.TIERS}
+    return lt.TierRule(mult=mult, dip=dip)
 
 
 # ================================================================ 格式工具
@@ -230,8 +233,8 @@ prev_split = daily_split.iloc[-2] if len(daily_split) > 1 else last_split
 last_feat = feat.iloc[-1]
 rule = current_rule()
 
-tab_an, tab_chart, tab_dca, tab_watch, tab_bt = st.tabs(
-    ["分析", "圖表", "定期定額", "自選股", "短線回測"])
+tab_an, tab_plan, tab_chart, tab_watch, tab_bt = st.tabs(
+    ["分析", "投資計畫", "圖表", "自選股", "短線回測"])
 
 # ================================================================ 分析
 
@@ -252,13 +255,14 @@ with tab_an:
     ])
     st.caption("台股慣例：紅色代表上漲、綠色代表下跌。年線乖離和距高點都用還原權息價格計算。")
 
-    # ---- 加碼條件
+    # ---- 依你的規則，目前屬於哪一級
     if pd.notna(last_feat["bias"]) or pd.notna(last_feat["dd"]):
-        met = rule.met(last_feat)
-        msg = (f"**你的加碼條件：{rule.describe()}**　→　{'已成立' if met else '未成立'}"
-               f"（{rule.current_text(last_feat)}）")
-        (st.success if met else st.info)(msg)
-        st.caption("加碼條件可以在「定期定額」分頁調整。")
+        t = rule.tier(last_feat)
+        m = rule.mult[t]
+        msg = (f"**依你的規則，目前位階：{lt.TIER_LABEL[t]}**　→　本月投入基本金額的 **{m:g} 倍**  \n"
+               + "  \n".join(f"・{r}" for r in rule.reasons(last_feat)))
+        (st.success if t in ("dip", "cheap") else st.warning if t == "expensive" else st.info)(msg)
+        st.caption("規則和倍數可以在「投資計畫」分頁調整，那裡也會算出這個月要投入多少錢。")
 
     # ---- 規則式分析
     findings = lt.analyze(feat, yld, corr_with_2330(stock_id, a, token))
@@ -368,78 +372,148 @@ with tab_chart:
     else:
         st.info("沒有法人買賣資料。")
 
-# ================================================================ 定期定額
+# ================================================================ 投資計畫
 
-with tab_dca:
-    st.markdown("#### 定期定額回測")
-    st.caption(f"{stock_id} {stock_name}")
+with tab_plan:
+    st.markdown("#### 投資計畫")
+    st.caption(f"{stock_id} {stock_name}　預算只算這一檔。")
 
-    st.markdown("**加碼規則**（「分析」分頁也會用這個規則判斷）")
+    # ---- 1. 預算
+    st.markdown("**1. 預算**")
+    mode = st.radio("預算形式", ["每月固定", "一筆分批"], horizontal=True, key="plan_mode",
+                    help="每月固定：每個月拿出一樣的錢，另有一筆準備金。一筆分批：手上有一筆錢，分 N 個月投入，其中一部分當準備金。")
+    if mode == "每月固定":
+        q1, q2 = st.columns(2)
+        base = float(q1.number_input("每月基本金額（元）", 1000, 10_000_000, 5000, step=1000, key="plan_monthly"))
+        reserve_init = float(q2.number_input("準備金（元）", 0, 100_000_000, 20000, step=1000, key="plan_reserve",
+                                             help="另外存著、專門用來逢低多投的錢。"))
+        months = None
+        reserve_now = reserve_init
+    else:
+        q1, q2, q3 = st.columns(3)
+        total = float(q1.number_input("總金額（元）", 10_000, 100_000_000, 300_000, step=10_000, key="plan_total"))
+        months = int(q2.number_input("分幾個月", 2, 120, 12, key="plan_months"))
+        res_pct = float(q3.number_input("準備金比例 %", 0, 90, 30, step=5, key="plan_res_pct"))
+        reserve_init = total * res_pct / 100
+        base = (total - reserve_init) / months
+        st.caption(f"每月基本金額 {base:,.0f} 元 × {months} 個月，準備金 {reserve_init:,.0f} 元。")
+        reserve_now = float(st.number_input(
+            "目前準備金餘額（元）", 0.0, 100_000_000.0, reserve_init, step=1000.0,
+            help="第一個月就是上面算出的準備金。之後每個月照實際剩下的金額修改，本月計畫才會正確。"))
+
+    # ---- 2. 分級規則
+    st.markdown("**2. 分級規則**")
     k1, k2 = st.columns(2)
-    kind = k1.radio("條件", list(lt.RULE_KINDS), format_func=lt.RULE_KINDS.get,
+    kind = k1.radio("「大跌」的條件", list(lt.RULE_KINDS), format_func=lt.RULE_KINDS.get,
                     horizontal=True, key="rule_kind")
     thr_label = "回檔幅度 %" if kind == "drawdown" else "低於年線幅度 %（0 = 跌破就算）"
     k2.number_input(thr_label, 0.0, 60.0, 10.0, step=1.0, key="rule_thr")
+    mcols = st.columns(4)
+    for col, t in zip(mcols, lt.TIERS):
+        col.number_input(f"{lt.TIER_LABEL[t]} 倍數", 0.0, 5.0, lt.DEFAULT_MULT[t], step=0.25, key=f"m_{t}")
     rule = current_rule()
+    st.caption("判斷順序：先看「大跌」條件；不成立的話，看年線乖離在過去 5 年的分位："
+               "25% 以下為偏便宜、75% 以上為偏貴，中間為中性。"
+               "倍數大於 1 時多出來的錢從準備金拿（不夠就只拿剩下的），小於 1 時沒投的錢存回準備金。")
 
-    valid = feat["bias"].dropna()
-    min_start = (valid.index[0] if len(valid) else a.split.index[0]).date()
-    max_start = (a.split.index[-1] - pd.Timedelta(days=60)).date()
-    if min_start >= max_start:
-        st.info("歷史資料不夠長（至少需要一年多），沒辦法回測。")
+    # ---- 3. 本月計畫
+    st.markdown("**3. 本月計畫**")
+    if pd.isna(last_feat["bias"]) and pd.isna(last_feat["dd"]):
+        st.info("這檔的資料不到一年，還沒辦法判斷位階。")
     else:
-        st.markdown("**投入方式**")
-        p1, p2 = st.columns(2)
-        start = p1.date_input("開始日",
-                              value=min(max(min_start, date.today() - timedelta(days=365 * 5)), max_start),
-                              min_value=min_start, max_value=max_start, key="dca_start")
-        day = p2.number_input("每月扣款日", 1, 28, 6, key="dca_day")
-        p3, p4 = st.columns(2)
-        monthly = p3.number_input("每月金額（元）", 1000, 1_000_000, 5000, step=1000, key="dca_monthly")
-        extra = p4.number_input("加碼金額（元）", 0, 1_000_000, 5000, step=1000, key="dca_extra",
-                                help="條件成立的那個月，在扣款日額外多投入的金額。")
-        reinvest = st.checkbox("配息再投入", value=True, key="dca_reinvest")
+        t = rule.tier(last_feat)
+        m = rule.mult[t]
+        amt, d_res = lt.month_amount(base, reserve_now, m)
+        px_now = last_split["close"]
+        n_sh = int(amt // (px_now * (1 + lt.FEE_RATE)))
+        stat_grid([
+            ("目前位階", lt.TIER_LABEL[t], None),
+            ("倍數", f"{m:g} 倍", None),
+            ("本月投入", f"{amt:,.0f} 元", None),
+            ("約可買", f"{n_sh:,} 股", f"以收盤 {px_now:,.2f} 計"),
+            ("準備金變化", f"{d_res:+,.0f} 元", None),
+            ("準備金剩下", f"{reserve_now + d_res:,.0f} 元", None),
+        ])
+        lines = rule.reasons(last_feat)
+        if m > 1 and amt < base * m:
+            lines.append(f"規則要投 {base * m:,.0f} 元，但準備金只剩 {reserve_now:,.0f} 元，所以只能投 {amt:,.0f} 元。")
+        st.markdown("\n".join(f"- {x}" for x in lines))
+        st.caption(f"依據 {a.split.index[-1]:%Y-%m-%d} 收盤資料。這是照你設定的規則算出來的金額，不是投資建議；"
+                   "規則本身是否合適，可以參考下面的回測。")
+
+    # ---- 4. 回測
+    st.markdown("**4. 這套規則過去的表現**")
+    valid = feat["bias_pct"].dropna()
+    min_start = (valid.index[0] if len(valid) else a.split.index[-1]).date()
+    need_days = 31 * (months or 2) + 10
+    max_start = (a.split.index[-1] - pd.Timedelta(days=need_days)).date()
+    if min_start >= max_start:
+        st.info("歷史資料不夠長，沒辦法回測這個設定。")
+    else:
+        r1c, r2c = st.columns(2)
+        start = r1c.date_input("回測開始日",
+                               value=min(max(min_start, date.today() - timedelta(days=365 * 5)), max_start),
+                               min_value=min_start, max_value=max_start, key="plan_start")
+        day = r2c.number_input("每月扣款日", 1, 28, 6, key="plan_day")
+        reinvest = st.checkbox("配息再投入", value=True, key="plan_reinvest")
         with st.expander("手續費設定"):
             f1, f2 = st.columns(2)
-            disc = f1.number_input("手續費折扣", 0.1, 1.0, 1.0, step=0.05, key="dca_disc",
+            disc = f1.number_input("手續費折扣", 0.1, 1.0, 1.0, step=0.05, key="plan_disc",
                                    help="1 = 不打折；6 折填 0.6")
-            min_fee = f2.number_input("每筆最低手續費（元）", 0, 20, 1, key="dca_minfee",
+            min_fee = f2.number_input("每筆最低手續費（元）", 0, 20, 1, key="plan_minfee",
                                       help="許多券商的定期定額最低收 1 元，一般交易最低 20 元。")
-
-        params = lt.DcaParams(monthly=monthly, day=int(day), extra=extra, rule=rule,
-                              reinvest=reinvest, fee_discount=disc, min_fee=min_fee)
+        costs = lt.Costs(fee_discount=disc, min_fee=min_fee, reinvest=reinvest, day=int(day))
         price = a.split["close"]
+        sim = lambda **kw: lt.simulate_plan(price, a.dividends, feat, start, costs, **kw)  # noqa: E731
         try:
-            plain = lt.simulate(price, a.dividends, feat, start, params, "dca")
-            dip = lt.simulate(price, a.dividends, feat, start, params, "dip")
-            lump = lt.simulate(price, a.dividends, feat, start, params, "lump", lump=plain.stats["總投入"])
+            if mode == "每月固定":
+                results = [
+                    sim(name="分級投入", upfront=reserve_init, base=base, monthly_new=base,
+                        reserve0=reserve_init, rule=rule),
+                    sim(name="固定金額（準備金不動）", upfront=reserve_init, base=base, monthly_new=base,
+                        reserve0=reserve_init),
+                    sim(name="固定金額＋準備金一開始投入", upfront=reserve_init, base=base, monthly_new=base,
+                        reserve0=0.0, lump_first=True),
+                ]
+                note = ("三種方式的錢一樣多：每月同樣的基本金額，加上開始日就準備好的準備金。"
+                        "差別在準備金怎麼用。")
+            else:
+                results = [
+                    sim(name="分級投入", upfront=total, base=base, monthly_new=0, reserve0=reserve_init,
+                        months=months, rule=rule),
+                    sim(name=f"平均分 {months} 個月", upfront=total, base=total / months, monthly_new=0,
+                        reserve0=0.0, months=months),
+                    sim(name="開始日一次投入", upfront=total, base=0, monthly_new=0, reserve0=0.0,
+                        lump_first=True),
+                ]
+                note = (f"三種方式都是同一筆 {total:,.0f} 元。分級投入在 {months} 個月後如果準備金還有剩，"
+                        "會以現金留著（列在「未投入現金」）。")
         except ValueError as exc:
             st.warning(str(exc))
         else:
-            results = [plain, dip, lump]
             comp = pd.DataFrame({r.name: r.stats for r in results}).T
-            st.dataframe(
-                comp.style.format({"總投入": "{:,.0f}", "期末市值": "{:,.0f}", "總報酬%": "{:+.2f}",
-                                   "年化報酬%": "{:+.2f}", "最大帳面虧損%": "{:.2f}", "加碼次數": "{:.0f}",
-                                   "累計配息": "{:,.0f}"}, na_rep="—")
-                .map(color_updown, subset=["總報酬%", "年化報酬%"]),
-                width="stretch")
-            st.caption("年化報酬用 XIRR 計算，會考慮每筆錢投入的時間點，三種方式可以直接比較。"
-                       "最大帳面虧損 = 期間內市值低於累計投入最多的幅度。"
-                       "單筆投入 = 開始日一次投入和純定期定額相同的總金額。")
-
+            fmt = {c: "{:,.0f}" for c in comp.columns}
+            fmt.update({"總報酬%": "{:+.2f}", "年化報酬%": "{:+.2f}", "最大帳面虧損%": "{:.2f}"})
+            st.dataframe(comp.style.format(fmt, na_rep="—").map(color_updown, subset=["總報酬%", "年化報酬%"]),
+                         width="stretch")
+            st.caption(note + " 年化報酬用 XIRR 計算，會考慮每筆錢投入的時間點。"
+                       "期末總值包含持股市值和還沒投入的現金。最大帳面虧損 = 期間內總值低於累計投入最多的幅度。")
             st.plotly_chart(charts.dca(results), width="stretch", config=CFG)
-            st.markdown(f"##### 加碼時點（共 {dip.stats['加碼次數']} 次）")
-            st.plotly_chart(charts.dip_marks(price.loc[pd.Timestamp(start):], dip.events),
+
+            tiered = results[0]
+            st.markdown("##### 分級投入的每月位階")
+            st.plotly_chart(charts.tier_marks(price.loc[pd.Timestamp(start):], tiered.events),
                             width="stretch", config=CFG)
-            with st.expander("定期定額＋逢低加碼的每筆紀錄"):
-                if not dip.events.empty:
-                    ev = dip.events.sort_values("日期", ascending=False).copy()
+            with st.expander("分級投入的每筆紀錄"):
+                if not tiered.events.empty:
+                    ev = tiered.events.sort_values("日期", ascending=False).copy()
                     ev["日期"] = ev["日期"].astype(str)
-                    st.dataframe(ev.style.format({"金額": "{:,.0f}", "價格": "{:,.2f}", "股數": "{:,}"}),
+                    st.dataframe(ev.style.format({"金額": "{:,.0f}", "價格": "{:,.2f}", "股數": "{:,}",
+                                                  "準備金餘額": "{:,.0f}"}),
                                  width="stretch", hide_index=True)
-            st.caption("回測假設：扣款日遇假日順延到下一個交易日，以當天收盤價買進整數股，剩下的錢留到下次。"
-                       "加碼條件用前一個交易日的收盤判斷。配息在除息日以收盤價再投入（實際入帳約晚一個月）。"
+            st.caption("回測假設：扣款日遇假日順延，以當天收盤價買整數股，剩下的零錢留到下次。"
+                       "位階用前一個交易日的收盤判斷，分位只用當天以前 5 年的資料。"
+                       "配息在除息日以收盤價再投入（實際入帳約晚一個月）。"
                        "沒有計入配息的所得稅與二代健保補充保費。過去績效不代表未來結果。")
 
 # ================================================================ 自選股
@@ -479,10 +553,10 @@ with tab_watch:
                 rows.append({
                     "代號": sid, "名稱": name_by_id.get(sid, ""),
                     "收盤": snap["收盤"], "漲跌%": snap["漲跌%"],
-                    "年線乖離%": wl["bias"], "乖離分位": lt.percentile(wf["bias"])[0],
+                    "年線乖離%": wl["bias"], "乖離分位": wl["bias_pct"],
                     "距高點%": wl["dd"],
                     "殖利率%": wy.dropna().iloc[-1] if wy is not None and wy.notna().any() else np.nan,
-                    "加碼條件": "成立" if rule.met(wl) else "未成立",
+                    "本月級別": f"{lt.TIER_LABEL[rule.tier(wl)]} ×{rule.mult[rule.tier(wl)]:g}",
                     "RSI": snap["RSI"], "KD": snap["KD"],
                 })
             bar.progress((i + 1) / len(watch), text=f"讀取自選股…{sid}")
@@ -497,7 +571,8 @@ with tab_watch:
                 .map(color_updown, subset=["漲跌%"]),
                 width="stretch", height=min(600, 40 + 36 * len(table)))
             st.caption(f"乖離分位：目前的年線乖離比過去 5 年中多少 % 的日子高（越低越便宜）。"
-                       f"加碼條件：{rule.describe()}。要看單一檔的詳細分析，請在最上方選擇該股票。")
+                       "本月級別：依「投資計畫」分頁的規則，這個月屬於哪一級、投入基本金額的幾倍。"
+                       "要看單一檔的詳細分析，請在最上方選擇該股票。")
 
 # ================================================================ 短線回測
 
