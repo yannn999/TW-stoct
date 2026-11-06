@@ -3,3 +3,5 @@ plotly>=5.20
 pandas>=2.2
 numpy>=1.26
 requests>=2.31
+gspread>=6.0
+google-auth>=2.20

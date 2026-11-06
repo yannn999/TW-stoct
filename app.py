@@ -6,8 +6,10 @@
 from __future__ import annotations
 
 import hmac
+import json
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -19,16 +21,24 @@ import charts
 import finmind as fm
 import indicators as ind
 import longterm as lt
+import portfolio as pf
+import settings as cfg
+import storage
 
 st.set_page_config(page_title="台股分析", page_icon="📈", layout="wide",
                    initial_sidebar_state="collapsed")
 
 HIST_DAYS = 365 * 8 + 120          # 抓 8 年：1 年算年線、再 1 年起算分位，回測還能有 5 年以上
-DEFAULT_WATCH = ["0050", "0056"]
+DEFAULT_WATCH = cfg.DEFAULT_WATCH.split(",")
 FREQ_LABEL = {"日K": "D", "週K": "W", "月K": "M"}
 RANGE_BARS = {"3個月": 63, "6個月": 126, "1年": 250, "3年": 750, "全部": None}
 BARS_PER = {"D": 1, "W": 5, "M": 21}
 CFG = charts.CONFIG
+
+
+def today_tw() -> date:
+    """台灣的今天（雲端主機用的是 UTC 時間）。"""
+    return datetime.now(ZoneInfo("Asia/Taipei")).date()
 
 
 # ================================================================ 設定與密碼
@@ -131,11 +141,66 @@ def yield_series(a: adj.Adjusted) -> pd.Series | None:
 
 
 def current_rule() -> lt.TierRule:
-    """投資計畫分頁的設定；其他分頁也用同一份。還沒打開過該分頁時用預設值。"""
-    ss = st.session_state
-    dip = lt.DipRule(ss.get("rule_kind", "drawdown"), float(ss.get("rule_thr", 10.0)))
-    mult = {t: float(ss.get(f"m_{t}", lt.DEFAULT_MULT[t])) for t in lt.TIERS}
-    return lt.TierRule(mult=mult, dip=dip)
+    """投資計畫分頁的分級規則；其他分頁也用同一份。"""
+    return cfg.tier_rule(st.session_state)
+
+
+# ================================================================ Google 試算表
+
+@st.cache_resource(show_spinner=False)
+def get_store():
+    """回傳 (Store 或 None, 錯誤訊息)。沒設定試算表時回傳 (None, "")。"""
+    url = secret("SHEET_URL")
+    try:
+        info = dict(st.secrets["gcp_service_account"])          # TOML 表格格式
+    except Exception:  # noqa: BLE001
+        info = None
+    raw = secret("GCP_SERVICE_ACCOUNT")                           # 或直接貼整段 JSON
+    if not info and raw.strip():
+        try:
+            info = json.loads(raw)
+        except ValueError:
+            return None, "GCP_SERVICE_ACCOUNT 不是正確的 JSON。請把下載的金鑰檔內容完整貼上（包含最外層的大括號）。"
+    if not url or not info:
+        return None, ""
+    try:
+        return storage.connect(info, url), ""
+    except storage.StoreError as exc:
+        return None, str(exc)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_records() -> pd.DataFrame:
+    store, _ = get_store()
+    return store.records() if store else storage.parse_records(pd.DataFrame(columns=storage.RECORD_COLS))
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_settings() -> dict:
+    store, _ = get_store()
+    return store.settings() if store else {}
+
+
+def store_write(fn, *args) -> bool:
+    """寫入試算表，成功後清掉快取。"""
+    try:
+        fn(*args)
+    except storage.StoreError as exc:
+        st.error(str(exc))
+        return False
+    load_records.clear()
+    load_settings.clear()
+    return True
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def robust_check(stock_id: str, token: str, rule_vals: tuple, base: float, reserve: float,
+                 years: int, cost_vals: tuple) -> pd.DataFrame:
+    a_ = load_adjusted(stock_id, token)
+    f_ = lt.features(a_.total)
+    c_ = lt.Costs(*cost_vals)
+    return lt.rolling_compare(a_.split["close"], a_.dividends, f_, c_, cfg.tier_rule(dict(rule_vals)),
+                              base, reserve, years)
 
 
 # ================================================================ 格式工具
@@ -212,6 +277,25 @@ st.query_params["s"] = stock_id
 stock_name = name_by_id.get(stock_id, "")
 is_etf = stock_id.startswith("00")
 
+# ---- 讀取試算表裡的設定，放進畫面上的欄位
+store, store_err = get_store()
+records = safe(load_records)
+if records is None:
+    records = storage.parse_records(pd.DataFrame(columns=storage.RECORD_COLS))
+user_settings = safe(load_settings) or {}
+ss = st.session_state
+for k in list(cfg.RULE_DEFAULTS) + list(cfg.PLAN_DEFAULTS):
+    if k in ss:          # 沒顯示的欄位（例如切換預算形式時）也保住數值
+        ss[k] = ss[k]
+if not ss.get("_rules_loaded"):
+    ss.update(cfg.rule_values(user_settings))
+    ss["_rules_loaded"] = True
+if ss.get("_plan_for") != stock_id:
+    ss.update(cfg.plan_values(user_settings, stock_id))
+    ss["_plan_for"] = stock_id
+if "_flash" in ss:
+    st.toast(ss.pop("_flash"))
+
 try:
     with st.spinner("讀取資料…"):
         a = load_adjusted(stock_id, token)
@@ -233,8 +317,8 @@ prev_split = daily_split.iloc[-2] if len(daily_split) > 1 else last_split
 last_feat = feat.iloc[-1]
 rule = current_rule()
 
-tab_an, tab_plan, tab_chart, tab_watch, tab_bt = st.tabs(
-    ["分析", "投資計畫", "圖表", "自選股", "短線回測"])
+tab_an, tab_plan, tab_hold, tab_chart, tab_watch, tab_bt = st.tabs(
+    ["分析", "投資計畫", "我的持倉", "圖表", "自選股", "短線回測"])
 
 # ================================================================ 分析
 
@@ -378,6 +462,8 @@ with tab_chart:
 with tab_plan:
     st.markdown("#### 投資計畫")
     st.caption(f"{stock_id} {stock_name}　預算只算這一檔。")
+    if store_err:
+        st.error(store_err)
 
     # ---- 1. 預算
     st.markdown("**1. 預算**")
@@ -385,37 +471,58 @@ with tab_plan:
                     help="每月固定：每個月拿出一樣的錢，另有一筆準備金。一筆分批：手上有一筆錢，分 N 個月投入，其中一部分當準備金。")
     if mode == "每月固定":
         q1, q2 = st.columns(2)
-        base = float(q1.number_input("每月基本金額（元）", 1000, 10_000_000, 5000, step=1000, key="plan_monthly"))
-        reserve_init = float(q2.number_input("準備金（元）", 0, 100_000_000, 20000, step=1000, key="plan_reserve",
-                                             help="另外存著、專門用來逢低多投的錢。"))
-        months = None
-        reserve_now = reserve_init
+        q1.number_input("每月基本金額（元）", 1000, 10_000_000, step=1000, key="plan_monthly")
+        q2.number_input("準備金（元）", 0, 100_000_000, step=1000, key="plan_reserve",
+                        help="另外存著、專門用來逢低多投的錢。回測用這個金額當起始準備金。")
     else:
         q1, q2, q3 = st.columns(3)
-        total = float(q1.number_input("總金額（元）", 10_000, 100_000_000, 300_000, step=10_000, key="plan_total"))
-        months = int(q2.number_input("分幾個月", 2, 120, 12, key="plan_months"))
-        res_pct = float(q3.number_input("準備金比例 %", 0, 90, 30, step=5, key="plan_res_pct"))
-        reserve_init = total * res_pct / 100
-        base = (total - reserve_init) / months
+        q1.number_input("總金額（元）", 10_000, 100_000_000, step=10_000, key="plan_total")
+        q2.number_input("分幾個月", 2, 120, key="plan_months")
+        q3.number_input("準備金比例 %", 0, 90, step=5, key="plan_res_pct")
+    base, reserve_init, months = cfg.plan_budget({k: ss[k] for k in cfg.PLAN_DEFAULTS})
+    if mode == "一筆分批":
         st.caption(f"每月基本金額 {base:,.0f} 元 × {months} 個月，準備金 {reserve_init:,.0f} 元。")
+
+    has_res_rows = bool(((records["代號"] == stock_id) & (records["類型"] == "準備金")).any())
+    if store and has_res_rows:
+        reserve_now = pf.reserve_balance(records, stock_id)
+        st.caption(f"目前準備金餘額 **{reserve_now:,.0f} 元**（從投資紀錄自動計算）。")
+    elif store:
+        reserve_now = reserve_init
+        st.caption("投資紀錄裡還沒有這一檔的準備金，先用上面的金額計算。")
+        if st.button(f"把 {reserve_init:,.0f} 元記為起始準備金", key="init_reserve"):
+            if store_write(store.add_records, [{"日期": today_tw().isoformat(), "代號": stock_id, "類型": "準備金",
+                                               "股數": "", "價格": "", "金額": round(reserve_init),
+                                               "備註": "起始準備金"}]):
+                ss["_flash"] = "已記錄起始準備金。"
+                st.rerun()
+    else:
         reserve_now = float(st.number_input(
-            "目前準備金餘額（元）", 0.0, 100_000_000.0, reserve_init, step=1000.0,
-            help="第一個月就是上面算出的準備金。之後每個月照實際剩下的金額修改，本月計畫才會正確。"))
+            "目前準備金餘額（元）", 0.0, 100_000_000.0, float(reserve_init), step=1000.0,
+            help="還沒連接 Google 試算表，請手動填實際剩下的金額。第一次使用時就是上面的準備金。"))
 
     # ---- 2. 分級規則
-    st.markdown("**2. 分級規則**")
+    st.markdown("**2. 分級規則**（全部股票共用）")
     k1, k2 = st.columns(2)
     kind = k1.radio("「大跌」的條件", list(lt.RULE_KINDS), format_func=lt.RULE_KINDS.get,
                     horizontal=True, key="rule_kind")
     thr_label = "回檔幅度 %" if kind == "drawdown" else "低於年線幅度 %（0 = 跌破就算）"
-    k2.number_input(thr_label, 0.0, 60.0, 10.0, step=1.0, key="rule_thr")
+    k2.number_input(thr_label, 0.0, 60.0, step=1.0, key="rule_thr")
     mcols = st.columns(4)
     for col, t in zip(mcols, lt.TIERS):
-        col.number_input(f"{lt.TIER_LABEL[t]} 倍數", 0.0, 5.0, lt.DEFAULT_MULT[t], step=0.25, key=f"m_{t}")
+        col.number_input(f"{lt.TIER_LABEL[t]} 倍數", 0.0, 5.0, step=0.25, key=f"m_{t}")
     rule = current_rule()
     st.caption("判斷順序：先看「大跌」條件；不成立的話，看年線乖離在過去 5 年的分位："
                "25% 以下為偏便宜、75% 以上為偏貴，中間為中性。"
                "倍數大於 1 時多出來的錢從準備金拿（不夠就只拿剩下的），小於 1 時沒投的錢存回準備金。")
+    if store:
+        if st.button("儲存設定（分級規則＋這一檔的預算）", key="save_settings"):
+            vals = {k: ss[k] for k in cfg.RULE_DEFAULTS}
+            vals.update({f"plan.{stock_id}.{k}": ss[k] for k in cfg.PLAN_DEFAULTS})
+            if store_write(store.save_settings, vals):
+                st.success("已儲存。下次打開會自動帶入，收盤通知也會用這份設定。")
+    else:
+        st.caption("連接 Google 試算表後，可以把設定存起來，下次打開自動帶入（設定方式見 README）。")
 
     # ---- 3. 本月計畫
     st.markdown("**3. 本月計畫**")
@@ -425,7 +532,7 @@ with tab_plan:
         t = rule.tier(last_feat)
         m = rule.mult[t]
         amt, d_res = lt.month_amount(base, reserve_now, m)
-        px_now = last_split["close"]
+        px_now = float(last_split["close"])
         n_sh = int(amt // (px_now * (1 + lt.FEE_RATE)))
         stat_grid([
             ("本月建議", lt.TIER_ACTION[t], f"位階：{lt.TIER_LABEL[t]}"),
@@ -442,28 +549,53 @@ with tab_plan:
         st.caption(f"依據 {a.split.index[-1]:%Y-%m-%d} 收盤資料，依你設定的規則計算。"
                    "規則本身是否合適，可以參考下面的回測；位階便宜不代表之後不會再跌。")
 
+        if store:
+            with st.form("record_month"):
+                st.markdown("**記錄本月投入**（買進後填實際成交的股數和價格）")
+                f1, f2, f3 = st.columns(3)
+                d_ = f1.date_input("日期", value=today_tw())
+                n_ = f2.number_input("買進股數", 0, 100_000_000, n_sh)
+                p_ = f3.number_input("成交價", 0.0, 1_000_000.0, round(px_now, 2), step=0.05, format="%.2f")
+                note_ = st.text_input("備註", value=f"本月分級投入（{lt.TIER_LABEL[t]}）")
+                ok = st.form_submit_button("記錄")
+            if ok:
+                if n_ <= 0 or p_ <= 0:
+                    st.warning("股數和成交價都要大於 0。")
+                else:
+                    paid = pf.trade_amount("買進", n_, p_, ss.get("plan_disc", 1.0), ss.get("plan_minfee", 1))
+                    rows = [{"日期": d_.isoformat(), "代號": stock_id, "類型": "買進", "股數": int(n_),
+                             "價格": p_, "金額": paid, "備註": note_}]
+                    if round(d_res):
+                        rows.append({"日期": d_.isoformat(), "代號": stock_id, "類型": "準備金", "股數": "",
+                                     "價格": "", "金額": round(d_res),
+                                     "備註": "本月動用準備金" if d_res < 0 else "本月存入準備金"})
+                    if store_write(store.add_records, rows):
+                        ss["_flash"] = f"已記錄：買進 {int(n_):,} 股，準備金 {d_res:+,.0f} 元。"
+                        st.rerun()
+
     # ---- 4. 回測
     st.markdown("**4. 這套規則過去的表現**")
+    disc, min_fee, reinvest, day = 1.0, 1, True, int(ss["plan_day"])
     valid = feat["bias_pct"].dropna()
     min_start = (valid.index[0] if len(valid) else a.split.index[-1]).date()
     need_days = 31 * (months or 2) + 10
     max_start = (a.split.index[-1] - pd.Timedelta(days=need_days)).date()
+    r1c, r2c = st.columns(2)
+    r2c.number_input("每月扣款日", 1, 28, key="plan_day")
+    reinvest = st.checkbox("配息再投入", value=True, key="plan_reinvest")
+    with st.expander("手續費設定"):
+        f1, f2 = st.columns(2)
+        disc = f1.number_input("手續費折扣", 0.1, 1.0, 1.0, step=0.05, key="plan_disc",
+                               help="1 = 不打折；6 折填 0.6")
+        min_fee = f2.number_input("每筆最低手續費（元）", 0, 20, 1, key="plan_minfee",
+                                  help="許多券商的定期定額最低收 1 元，一般交易最低 20 元。")
+    costs = lt.Costs(fee_discount=disc, min_fee=min_fee, reinvest=reinvest, day=int(day))
     if min_start >= max_start:
         st.info("歷史資料不夠長，沒辦法回測這個設定。")
     else:
-        r1c, r2c = st.columns(2)
         start = r1c.date_input("回測開始日",
                                value=min(max(min_start, date.today() - timedelta(days=365 * 5)), max_start),
                                min_value=min_start, max_value=max_start, key="plan_start")
-        day = r2c.number_input("每月扣款日", 1, 28, 6, key="plan_day")
-        reinvest = st.checkbox("配息再投入", value=True, key="plan_reinvest")
-        with st.expander("手續費設定"):
-            f1, f2 = st.columns(2)
-            disc = f1.number_input("手續費折扣", 0.1, 1.0, 1.0, step=0.05, key="plan_disc",
-                                   help="1 = 不打折；6 折填 0.6")
-            min_fee = f2.number_input("每筆最低手續費（元）", 0, 20, 1, key="plan_minfee",
-                                      help="許多券商的定期定額最低收 1 元，一般交易最低 20 元。")
-        costs = lt.Costs(fee_discount=disc, min_fee=min_fee, reinvest=reinvest, day=int(day))
         price = a.split["close"]
         sim = lambda **kw: lt.simulate_plan(price, a.dividends, feat, start, costs, **kw)  # noqa: E731
         try:
@@ -479,6 +611,7 @@ with tab_plan:
                 note = ("三種方式的錢一樣多：每月同樣的基本金額，加上開始日就準備好的準備金。"
                         "差別在準備金怎麼用。")
             else:
+                total = float(ss["plan_total"])
                 results = [
                     sim(name="分級投入", upfront=total, base=base, monthly_new=0, reserve0=reserve_init,
                         months=months, rule=rule),
@@ -517,10 +650,168 @@ with tab_plan:
                        "配息在除息日以收盤價再投入（實際入帳約晚一個月）。"
                        "沒有計入配息的所得稅與二代健保補充保費。過去績效不代表未來結果。")
 
+    # ---- 5. 穩健性檢查
+    st.markdown("**5. 穩健性檢查**")
+    st.caption("上面的回測只看一個開始日，結果可能剛好運氣好或不好。這裡改成從過去每個月分別開始、"
+               "各投資幾年，看分級投入有幾成的機會贏過固定金額。用「每月基本金額＋準備金」的方式計算。")
+    rc1, rc2 = st.columns(2)
+    run_robust = rc1.toggle("執行檢查", key="robust_on")
+    years = rc2.select_slider("每次投資幾年", options=[2, 3, 5], value=3, key="robust_years")
+    if run_robust:
+        with st.spinner("計算中…"):
+            rdf = robust_check(stock_id, token, tuple(sorted(cfg.rule_values(ss).items())), base,
+                               reserve_init, years, (disc, min_fee, reinvest, int(day)))
+        if rdf.empty:
+            st.info(f"歷史資料不夠長，沒辦法做 {years} 年的檢查，請改短一點。")
+        else:
+            d1 = rdf["差距（vs 準備金先投）"].dropna()
+            d2 = rdf["差距（vs 準備金不動）"].dropna()
+            less_loss = (rdf["分級最大虧損%"] > rdf["固定（準備金先投）最大虧損%"]).mean() * 100
+            stat_grid([
+                ("檢查次數", f"{len(rdf)} 次", f"{rdf['開始月'].iloc[0]} 到 {rdf['開始月'].iloc[-1]} 開始"),
+                ("贏過「準備金先投」", f"{(d1 > 0).mean() * 100:.0f}%", f"平均差 {d1.mean():+.2f}%/年"),
+                ("贏過「準備金不動」", f"{(d2 > 0).mean() * 100:.0f}%", f"平均差 {d2.mean():+.2f}%/年"),
+                ("最好的一次", f"{d1.max():+.2f}%/年", "vs 準備金先投"),
+                ("最差的一次", f"{d1.min():+.2f}%/年", "vs 準備金先投"),
+                ("最大虧損比較小", f"{less_loss:.0f}%", "vs 準備金先投"),
+            ])
+            st.plotly_chart(charts.robust(rdf), width="stretch", config=CFG)
+            st.caption("每根柱子是「從那個月開始投資」時，分級投入比「準備金一開始就投入」每年多（紅）或少（綠）"
+                       "的報酬。準備金一開始就投入，等於完全不等時機；如果分級投入只有一半左右的機會贏，"
+                       "代表這套規則在這段期間沒有明顯優勢。")
+            with st.expander("每次檢查的結果"):
+                st.dataframe(rdf.set_index("開始月").style.format("{:+.2f}", na_rep="—"), width="stretch")
+
+# ================================================================ 我的持倉
+
+with tab_hold:
+    st.markdown("#### 我的持倉")
+    if not store:
+        if store_err:
+            st.error(store_err)
+        st.info("要使用投資紀錄，需要先連接一份 Google 試算表，設定步驟在 GitHub 的 README「投資紀錄設定」。"
+                "連接後，每次買進、賣出或存入準備金都可以在這裡記錄，App 會自動算出持倉、損益、配息和準備金餘額。")
+    else:
+        rows = []
+        for sid in sorted(set(records["代號"])):
+            try:
+                w = load_adjusted(sid, token)
+            except Exception as exc:  # noqa: BLE001
+                st.warning(f"{sid} 讀取股價失敗：{exc}")
+                continue
+            res = pf.reserve_balance(records, sid)
+            pos = pf.position(records, sid, w.split["close"], w.dividends, w.splits) if w is not None else None
+            if pos is None and res == 0:
+                continue
+            rows.append({"代號": sid, "名稱": name_by_id.get(sid, ""), **(pos or {}), "準備金餘額": res})
+
+        if rows:
+            tbl = pd.DataFrame(rows).set_index("代號")
+            for c in ("市值", "持有成本", "未實現損益", "預估已領配息", "已實現損益"):
+                if c not in tbl:
+                    tbl[c] = 0.0
+            tot_val, tot_cost = tbl["市值"].sum(), tbl["持有成本"].sum()
+            unreal = tbl["未實現損益"].sum()
+            stat_grid([
+                ("總市值", f"{tot_val:,.0f}", None),
+                ("持有成本", f"{tot_cost:,.0f}", None),
+                ("未實現損益", f"{unreal:+,.0f}", f"{unreal / tot_cost * 100:+.2f}%" if tot_cost else None),
+                ("預估已領配息", f"{tbl['預估已領配息'].sum():,.0f}", None),
+                ("已實現損益", f"{tbl['已實現損益'].sum():+,.0f}", None),
+                ("準備金合計", f"{tbl['準備金餘額'].sum():,.0f}", None),
+            ])
+            cols = [c for c in ["名稱", "持有股數", "平均成本", "現價", "市值", "未實現損益", "未實現報酬%",
+                                "預估已領配息", "年化報酬%", "準備金餘額"] if c in tbl]
+            st.dataframe(
+                tbl[cols].style.format({"持有股數": "{:,.0f}", "平均成本": "{:,.2f}", "現價": "{:,.2f}",
+                                        "市值": "{:,.0f}", "未實現損益": "{:+,.0f}", "未實現報酬%": "{:+.2f}",
+                                        "預估已領配息": "{:,.0f}", "年化報酬%": "{:+.2f}", "準備金餘額": "{:,.0f}"},
+                                       na_rep="—")
+                .map(color_updown, subset=[c for c in ("未實現損益", "未實現報酬%", "年化報酬%") if c in cols]),
+                width="stretch")
+            st.caption("平均成本含手續費。配息依除息日的持股股數自動估算（稅前、未扣二代健保補充保費）。"
+                       "年化報酬用 XIRR，把每筆買賣、配息的時間點都算進去。"
+                       "分割前買的股數已換算成現在的單位。")
+        else:
+            st.info("還沒有紀錄，用下面的表單新增第一筆。")
+
+        # ---- 新增紀錄
+        st.markdown("##### 新增紀錄")
+        kind = st.radio("類型", storage.RECORD_TYPES, horizontal=True, key="rec_kind")
+        with st.form("add_record", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            d_ = c1.date_input("日期", value=today_tw(), key="rec_date")
+            if labels:
+                cur = next((l for l in labels if l.split(" ")[0] == stock_id), labels[0])
+                sid_ = id_by_label[c2.selectbox("股票", labels, index=labels.index(cur), key="rec_stock")]
+            else:
+                sid_ = c2.text_input("代號", stock_id, key="rec_stock_text").strip()
+            if kind in ("買進", "賣出"):
+                c3, c4 = st.columns(2)
+                n_ = c3.number_input("股數", 0, 100_000_000, 0, step=1, key="rec_shares")
+                p_ = c4.number_input("成交價", 0.0, 1_000_000.0, 0.0, step=0.05, format="%.2f", key="rec_price")
+                c5, c6 = st.columns(2)
+                disc_ = c5.number_input("手續費折扣", 0.1, 1.0, 1.0, step=0.05, key="rec_disc")
+                minfee_ = c6.number_input("最低手續費（元）", 0, 20, 1, key="rec_minfee")
+                amt_in = st.number_input("實際金額（選填，0 = 自動計算）", 0, 1_000_000_000, 0, step=1, key="rec_amt",
+                                         help="填券商對帳單上的實際收付金額最準。買進含手續費，賣出是扣掉手續費和稅後拿到的錢。")
+            else:
+                dir_ = st.radio("存入或動用", ["存入", "動用"], horizontal=True, key="rec_dir")
+                res_amt = st.number_input("金額（元）", 0, 1_000_000_000, 0, step=1000, key="rec_res_amt")
+            note_ = st.text_input("備註", key="rec_note")
+            ok = st.form_submit_button("新增")
+        if ok:
+            row = {"日期": d_.isoformat(), "代號": sid_, "類型": kind, "股數": "", "價格": "", "金額": 0,
+                   "備註": note_}
+            err = ""
+            if kind in ("買進", "賣出"):
+                if n_ <= 0 or p_ <= 0:
+                    err = "股數和成交價都要大於 0。"
+                else:
+                    tax = 0.001 if sid_.startswith("00") else 0.003
+                    row.update({"股數": int(n_), "價格": p_,
+                                "金額": amt_in or pf.trade_amount(kind, n_, p_, disc_, minfee_, tax)})
+            else:
+                if res_amt <= 0:
+                    err = "金額要大於 0。"
+                else:
+                    row["金額"] = int(res_amt) if dir_ == "存入" else -int(res_amt)
+            if err:
+                st.warning(err)
+            elif store_write(store.add_records, [row]):
+                ss["_flash"] = f"已新增：{sid_} {kind} {row['金額']:,} 元。"
+                st.rerun()
+
+        # ---- 紀錄列表
+        st.markdown("##### 全部紀錄")
+        if records.empty:
+            st.caption("還沒有紀錄。")
+        else:
+            show = records.sort_values(["日期", "列號"], ascending=False)
+            disp = show[["日期", "代號", "類型", "股數", "價格", "金額", "備註"]].copy()
+            disp["日期"] = disp["日期"].dt.strftime("%Y-%m-%d")
+            st.dataframe(disp.style.format({"股數": "{:,.0f}", "價格": "{:,.2f}", "金額": "{:+,.0f}"}),
+                         width="stretch", hide_index=True)
+            with st.expander("刪除一筆紀錄"):
+                opts = {f"{r['日期']:%Y-%m-%d}　{r['代號']}　{r['類型']}　{r['金額']:+,.0f}（試算表第 {r['列號']} 列）":
+                        int(r["列號"]) for _, r in show.iterrows()}
+                pick = st.selectbox("要刪除的紀錄", list(opts), index=None, placeholder="選擇一筆紀錄",
+                                    key="del_pick")
+                sure = st.checkbox("確定要刪除這一筆", key="del_sure")
+                if st.button("刪除", disabled=not (sure and pick), key="del_btn"):
+                    if store_write(store.delete_record, opts[pick]):
+                        ss.pop("del_sure", None)
+                        ss.pop("del_pick", None)
+                        ss["_flash"] = "已刪除。"
+                        st.rerun()
+            st.caption("也可以直接打開 Google 試算表修改。App 最多 5 分鐘後會讀到新資料，"
+                       "或按側邊欄的「重新抓取資料」立即更新。")
+
 # ================================================================ 自選股
 
 with tab_watch:
-    saved = [s for s in st.query_params.get("w", ",".join(DEFAULT_WATCH)).split(",") if s]
+    default_w = user_settings.get("watchlist", ",".join(DEFAULT_WATCH))
+    saved = [x for x in st.query_params.get("w", default_w).split(",") if x]
     if labels:
         label_by_id = {v: k for k, v in id_by_label.items()}
         picked = st.multiselect("自選股", labels, default=[label_by_id[s] for s in saved if s in label_by_id],
@@ -530,7 +821,12 @@ with tab_watch:
         text = st.text_input("自選股代號（用逗號分隔）", ",".join(saved), key="watch_text")
         watch = [s.strip() for s in text.split(",") if s.strip()]
     st.query_params["w"] = ",".join(watch)
-    st.caption("自選股存在網址裡。設定好之後把這個網址加到手機主畫面，下次打開就是同一份清單。")
+    if store:
+        if st.button("儲存自選股（收盤通知也會用這份清單）", key="save_watch"):
+            if store_write(store.save_settings, {"watchlist": ",".join(watch)}):
+                st.success("已儲存。")
+    else:
+        st.caption("自選股存在網址裡。設定好之後把這個網址加到手機主畫面，下次打開就是同一份清單。")
 
     if not watch:
         st.info("還沒有自選股，從上方選單加入。")

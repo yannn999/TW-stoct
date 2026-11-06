@@ -205,3 +205,17 @@ def trades_on_price(df: pd.DataFrame, trades: pd.DataFrame) -> go.Figure:
         fig.add_trace(go.Scatter(x=pd.to_datetime(sold["賣出日"]), y=sold["賣出價"], mode="markers",
                                  name="賣出", marker=dict(symbol="triangle-down", size=10, color=DOWN)))
     return _base_layout(fig, 300)
+
+
+def robust(df: pd.DataFrame) -> go.Figure:
+    """穩健性檢查：每個開始月份，分級投入比「準備金先投」每年多或少的報酬。"""
+    d = df["差距（vs 準備金先投）"]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=df["開始月"], y=d, name="分級投入 − 準備金先投",
+                         marker_color=[UP if v >= 0 else DOWN for v in d.fillna(0)]))
+    fig.add_trace(go.Scatter(x=df["開始月"], y=df["差距（vs 準備金不動）"], name="分級投入 − 準備金不動",
+                             mode="lines", line=dict(color="#4361ee", width=1.3)))
+    fig.add_hline(y=0, line=dict(color=GRID, width=1))
+    fig.update_yaxes(title_text="年化報酬差（%）", ticksuffix="%")
+    fig.update_xaxes(title_text="開始投資的月份", type="category", nticks=8)
+    return _base_layout(fig, 320)

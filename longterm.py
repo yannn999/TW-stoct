@@ -112,6 +112,17 @@ class TierRule:
             return "expensive"
         return "neutral"
 
+    def tiers(self, feat: pd.DataFrame) -> np.ndarray:
+        """整段資料一次算出每天的級別（和 tier() 結果相同，但快很多）。"""
+        if self.dip.kind == "drawdown":
+            dip = (feat["dd"] <= -self.dip.threshold).to_numpy()
+        else:
+            dip = (feat["bias"] <= -self.dip.threshold).to_numpy()
+        p = feat["bias_pct"].to_numpy(dtype=float)
+        with np.errstate(invalid="ignore"):
+            out = np.where(p <= self.cheap_pct, "cheap", np.where(p >= self.expensive_pct, "expensive", "neutral"))
+        return np.where(dip, "dip", out)
+
     def reasons(self, row: pd.Series) -> list[str]:
         out = []
         if pd.notna(row.get("bias")):
@@ -285,7 +296,7 @@ def monthly_dates(index: pd.DatetimeIndex, start: pd.Timestamp, day: int) -> lis
 def simulate_plan(price: pd.Series, dividends: pd.Series, feat: pd.DataFrame, start, c: Costs, *,
                   name: str, upfront: float, base: float, monthly_new: float, reserve0: float,
                   months: int | None = None, rule: TierRule | None = None,
-                  lump_first: bool = False) -> PlanResult:
+                  lump_first: bool = False, end=None, keep_events: bool = True) -> PlanResult:
     """通用模擬。
 
     upfront     開始日一次拿出來的錢（計入投入）。其中 reserve0 是準備金，其餘是基本投入用的錢。
@@ -294,77 +305,133 @@ def simulate_plan(price: pd.Series, dividends: pd.Series, feat: pd.DataFrame, st
     months      只投入前 N 個月（None = 每個月都投入）
     rule        分級規則（None = 固定金額，準備金不動用）
     lump_first  開始日把基本投入用的錢一次投入（比較用）
+    end         回測結束日（None = 資料最後一天）
     """
-    px = price.loc[pd.Timestamp(start):].dropna()
-    if len(px) < 2:
+    px_s = price.loc[pd.Timestamp(start):(pd.Timestamp(end) if end is not None else None)].dropna()
+    if len(px_s) < 2:
         raise ValueError("回測區間太短")
-    divs = dividends.reindex(px.index).fillna(0.0)
-    prev_feat = feat.reindex(px.index).shift(1)   # 用前一個交易日收盤判斷，不偷看當天
-    dates = monthly_dates(px.index, px.index[0], c.day)
+    idx = px_s.index
+    P = px_s.to_numpy(dtype=float)
+    D = dividends.reindex(idx).fillna(0.0).to_numpy(dtype=float)
+    # 用前一個交易日收盤判斷，不偷看當天
+    T = rule.tiers(feat.shift(1).reindex(idx)) if rule is not None else None
+    dates = monthly_dates(idx, idx[0], c.day)
     if months is not None:
         dates = dates[:months]
-    dates = set(dates)
+    is_date = np.zeros(len(idx), dtype=bool)
+    is_date[idx.get_indexer(dates)] = True
 
+    rate = FEE_RATE * c.fee_discount
     shares = 0
     pool = upfront - reserve0     # 等待按月投入的錢
     reserve = reserve0
     spare = 0.0                   # 買整數股剩下的零錢、未再投入的配息
     invested = upfront
-    flows = [(px.index[0], -upfront)] if upfront else []
-    events, rows = [], []
+    flows = [(idx[0], -upfront)] if upfront else []
+    events = []
+    value = np.empty(len(idx))
+    inv_arr = np.empty(len(idx))
+    res_arr = np.empty(len(idx))
     tier_count = {t: 0 for t in TIERS}
 
-    def buy(day, amount, kind, tier=""):
+    def buy(i, amount, kind, tier=""):
         nonlocal shares, spare
-        n, spent = _buy(amount + spare, px[day], c)
+        budget = amount + spare
+        px = P[i]
+        n = int(budget // (px * (1 + rate)))
+        while n > 0 and n * px + max(n * px * rate, c.min_fee) > budget:
+            n -= 1
+        spent = n * px + max(n * px * rate, c.min_fee) if n > 0 else 0.0
         shares += n
-        spare = amount + spare - spent
-        events.append({"日期": day.date(), "類型": kind, "位階": tier, "金額": amount,
-                       "價格": px[day], "股數": n, "準備金餘額": reserve})
+        spare = budget - spent
+        if keep_events:
+            events.append({"日期": idx[i].date(), "類型": kind, "位階": tier, "金額": amount,
+                           "價格": px, "股數": n, "準備金餘額": reserve})
 
-    for day in px.index:
-        if divs[day] > 0 and shares > 0:
-            got = shares * divs[day]
+    for i in range(len(idx)):
+        if D[i] > 0 and shares > 0:
+            got = shares * D[i]
             if c.reinvest:
-                buy(day, got, "配息再投入")
+                buy(i, got, "配息再投入")
             else:
                 spare += got
-                events.append({"日期": day.date(), "類型": "配息（領現金）", "位階": "", "金額": got,
-                               "價格": px[day], "股數": 0, "準備金餘額": reserve})
-        if lump_first and day == px.index[0] and pool > 0:
+                if keep_events:
+                    events.append({"日期": idx[i].date(), "類型": "配息（領現金）", "位階": "", "金額": got,
+                                   "價格": P[i], "股數": 0, "準備金餘額": reserve})
+        if lump_first and i == 0 and pool > 0:
             amt, pool = pool, 0.0
-            buy(day, amt, "一次投入")
-        if day in dates:
+            buy(i, amt, "一次投入")
+        if is_date[i]:
             if monthly_new:
                 pool += monthly_new
                 invested += monthly_new
-                flows.append((day, -monthly_new))
+                flows.append((idx[i], -monthly_new))
             b = min(base, pool)
             if b > 0:
-                if rule is None:
+                if T is None:
                     pool -= b
-                    buy(day, b, "定期定額")
+                    buy(i, b, "定期定額")
                 else:
-                    t = rule.tier(prev_feat.loc[day])
+                    t = str(T[i])
                     tier_count[t] += 1
                     amt, d_res = month_amount(b, reserve, rule.mult[t])
                     pool -= b
                     reserve += d_res
-                    buy(day, amt, "分級投入", TIER_LABEL[t])
-        rows.append((day, shares * px[day] + pool + reserve + spare, invested, reserve))
+                    buy(i, amt, "分級投入", TIER_LABEL[t])
+        value[i] = shares * P[i] + pool + reserve + spare
+        inv_arr[i] = invested
+        res_arr[i] = reserve
 
-    daily = pd.DataFrame(rows, columns=["date", "value", "invested", "reserve"]).set_index("date")
-    end = daily.iloc[-1]
-    flows.append((px.index[-1], end["value"]))
-    active = daily[daily["invested"] > 0]
+    daily = pd.DataFrame({"value": value, "invested": inv_arr, "reserve": res_arr}, index=idx)
+    flows.append((idx[-1], value[-1]))
+    act = inv_arr > 0
     stats = {
         "總投入": invested,
-        "期末總值": end["value"],
-        "總報酬%": (end["value"] / invested - 1) * 100 if invested else np.nan,
+        "期末總值": value[-1],
+        "總報酬%": (value[-1] / invested - 1) * 100 if invested else np.nan,
         "年化報酬%": xirr(flows),
-        "最大帳面虧損%": float((active["value"] / active["invested"] - 1).min() * 100) if len(active) else np.nan,
+        "最大帳面虧損%": float((value[act] / inv_arr[act] - 1).min() * 100) if act.any() else np.nan,
         "未投入現金": pool + reserve + spare,
     }
     if rule is not None:
         stats.update({f"{TIER_LABEL[t]}次數": tier_count[t] for t in TIERS})
     return PlanResult(name, daily, pd.DataFrame(events), stats)
+
+
+def rolling_compare(price: pd.Series, dividends: pd.Series, feat: pd.DataFrame, c: Costs,
+                    rule: TierRule, base: float, reserve0: float, years: int = 3) -> pd.DataFrame:
+    """穩健性檢查：從每個月分別開始、各投資 years 年，比較分級投入和固定金額。
+
+    比較對象（三者投入的錢完全一樣：每月基本金額＋開始日的準備金）：
+    - 固定（準備金先投）：準備金在開始日一次買進，之後每月固定金額
+    - 固定（準備金不動）：每月固定金額，準備金一直放著
+    """
+    valid = feat["bias_pct"].dropna()
+    if valid.empty:
+        return pd.DataFrame()
+    last_start = price.index[-1] - pd.DateOffset(years=years)
+    starts = monthly_dates(price.index, valid.index[0], 1)
+    starts = [s for s in starts if s <= last_start]
+    rows = []
+    for s in starts:
+        e = s + pd.DateOffset(years=years)
+        kw = dict(start=s, c=c, end=e, base=base, monthly_new=base, keep_events=False)
+        tiered = simulate_plan(price, dividends, feat, name="", upfront=reserve0, reserve0=reserve0,
+                               rule=rule, **kw).stats
+        lump = simulate_plan(price, dividends, feat, name="", upfront=reserve0, reserve0=0.0,
+                             lump_first=True, **kw).stats
+        idle = simulate_plan(price, dividends, feat, name="", upfront=reserve0, reserve0=reserve0,
+                             **kw).stats
+        rows.append({
+            "開始月": s.strftime("%Y-%m"),
+            "分級投入%": tiered["年化報酬%"],
+            "固定（準備金先投）%": lump["年化報酬%"],
+            "固定（準備金不動）%": idle["年化報酬%"],
+            "分級最大虧損%": tiered["最大帳面虧損%"],
+            "固定（準備金先投）最大虧損%": lump["最大帳面虧損%"],
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["差距（vs 準備金先投）"] = df["分級投入%"] - df["固定（準備金先投）%"]
+        df["差距（vs 準備金不動）"] = df["分級投入%"] - df["固定（準備金不動）%"]
+    return df

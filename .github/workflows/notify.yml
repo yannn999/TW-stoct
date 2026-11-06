@@ -1,0 +1,31 @@
+name: 收盤通知
+
+on:
+  schedule:
+    - cron: "30 13 * * 1-5"   # 週一到週五 UTC 13:30 = 台灣時間 21:30（GitHub 排程可能延遲幾分鐘到幾十分鐘）
+  workflow_dispatch:          # 可以在 GitHub 的 Actions 頁面手動執行
+    inputs:
+      force:
+        description: "不管有沒有變化都傳一次（測試用）"
+        type: boolean
+        default: true
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: 檢查並傳送通知
+        run: python notify.py ${{ (github.event_name == 'workflow_dispatch' && inputs.force) && '--force' || '' }}
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          SHEET_URL: ${{ secrets.SHEET_URL }}
